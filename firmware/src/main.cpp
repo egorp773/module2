@@ -78,21 +78,21 @@ static constexpr int PIN_RELAY_MOUNT      = 33; // active HIGH
 // =======================
 // Drive tuning
 // =======================
-static constexpr int MAX_SPEED_PERCENT = 70;     // -70..70 (after input divide)
+static constexpr int MAX_SPEED_PERCENT = 100;    // -100..100 raw scale (app now applies its own max%)
 static constexpr int16_t HOVER_MAX_CMD = 300;    // hoverboard command scale
-static constexpr int INPUT_DIV = 2;             // app values / 2 (calmer)
+static constexpr int INPUT_DIV = 1;             // legacy — kept for compat; new app uses 4th arg
 
 static constexpr uint32_t HOVER_SEND_MS  = 20;
 static constexpr uint32_t CMD_TIMEOUT_MS = 400;
 
-// ramp (percent domain)
-static constexpr uint32_t RAMP_UPDATE_MS = 20;
-static constexpr int RAMP_STEP_UP_PER_TICK   = 1;
-static constexpr int RAMP_STEP_DOWN_PER_TICK = 1;
+// ramp (percent domain) — gentler, smoother take-off
+static constexpr uint32_t RAMP_UPDATE_MS = 40;
+static constexpr int RAMP_STEP_UP_PER_TICK   = 1;   // ~25%/s acceleration
+static constexpr int RAMP_STEP_DOWN_PER_TICK = 2;   // braking a bit snappier than accel
 
-// extra smoothing in hoverboard command domain
-static constexpr int16_t SLEW_SPEED_PER_SEND = 4;
-static constexpr int16_t SLEW_STEER_PER_SEND = 6;
+// extra smoothing in hoverboard command domain (small steps, not 4→2 jumps)
+static constexpr int16_t SLEW_SPEED_PER_SEND = 2;
+static constexpr int16_t SLEW_STEER_PER_SEND = 3;
 
 int16_t g_cmdSpeed = 0;
 int16_t g_cmdSteer = 0;
@@ -133,6 +133,7 @@ static constexpr size_t MAX_WS_MSG = 128;
 // =======================
 volatile int16_t g_targetLeft  = 0;
 volatile int16_t g_targetRight = 0;
+volatile int16_t g_maxPercent  = 100;   // set by app via M,L,R,MAX (10..100)
 int16_t g_curLeft  = 0;
 int16_t g_curRight = 0;
 
@@ -284,8 +285,15 @@ void updateRamp() {
   uint32_t ticks = dt / RAMP_UPDATE_MS;
   g_lastRampMs += ticks * RAMP_UPDATE_MS;
 
-  int16_t tL = clampi16(g_targetLeft,  -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
-  int16_t tR = clampi16(g_targetRight, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  // Apply app's max speed cap (10..100) to the target before ramping.
+  int16_t maxP = g_maxPercent;
+  if (maxP < 10)   maxP = 10;
+  if (maxP > 100)  maxP = 100;
+
+  int32_t tLraw = (int32_t)g_targetLeft  * maxP / 100;
+  int32_t tRraw = (int32_t)g_targetRight * maxP / 100;
+  int16_t tL = clampi16(tLraw, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  int16_t tR = clampi16(tRraw, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
 
   int limL = limitForAxis(g_curLeft,  tL, (int)ticks);
   int limR = limitForAxis(g_curRight, tR, (int)ticks);
@@ -387,9 +395,10 @@ void debugPrintWheelSpeeds() {
 }
 
 // =======================
-// Parse "M,left,right"
+// Parse "M,left,right[,max]"
+// left/right: -100..100, max: 10..100 (optional, default 100)
 // =======================
-bool parseMove(const char* msg, int16_t& outL, int16_t& outR) {
+bool parseMove(const char* msg, int16_t& outL, int16_t& outR, int16_t& outMax) {
   if (!startsWith(msg, "M,")) return false;
 
   const char* p = msg + 2;
@@ -402,8 +411,15 @@ bool parseMove(const char* msg, int16_t& outL, int16_t& outR) {
   long R = strtol(p2, &end2, 10);
   if (!end2) return false;
 
-  L = L / INPUT_DIV;
-  R = R / INPUT_DIV;
+  outMax = 100; // default
+  if (*end2 == ',') {
+    const char* p3 = end2 + 1;
+    char* end3 = nullptr;
+    long M = strtol(p3, &end3, 10);
+    if (end3 && M >= 10 && M <= 100) {
+      outMax = (int16_t)M;
+    }
+  }
 
   outL = clampi16(L, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
   outR = clampi16(R, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
@@ -456,10 +472,11 @@ void onWsEvent(AsyncWebSocket *serverPtr, AsyncWebSocketClient *client,
     if (streq(msg, "STOP")) { requestSmoothStop("STOP_cmd"); client->text("OK STOP"); return; }
 
     // ---- movement
-    int16_t L=0, R=0;
-    if (parseMove(msg, L, R)) {
+    int16_t L=0, R=0, M=100;
+    if (parseMove(msg, L, R, M)) {
       g_targetLeft = L;
       g_targetRight = R;
+      g_maxPercent = M;
       client->text("OK M");
       return;
     }
